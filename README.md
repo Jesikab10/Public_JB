@@ -1,4 +1,4 @@
-# Public_JB
+# video-pipeline-architecture
 
 Architecture write-ups of production systems I designed and built. The source code is private, so this repo documents how each system works and why it is built that way. It contains no secrets, resource IDs, client data or business metrics.
 
