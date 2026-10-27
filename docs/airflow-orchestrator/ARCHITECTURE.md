@@ -8,23 +8,45 @@ A pipeline that takes raw footage, validates it technically, trims and assembles
 
 ## 2. Architecture
 
+```mermaid
+flowchart TD
+    A["Intake form / project-management board<br/>(Monday.com)"] -->|webhook| B["Bridge (Cloud Run)<br/>validates payload"]
+    B -->|Airflow REST API| C
+    subgraph C["Cloud Composer (Airflow 3.1)"]
+        D0["DAG0 · job registration"] --> D1["DAG1 · ingest"]
+        D1 --> D2["DAG2 · processing"]
+        D2 --> D3["DAG3 · publish"]
+    end
+    C -->|HTTP| R["Cloud Run<br/>ffmpeg GPU NVENC / CPU<br/>ffprobe · transcription"]
+    C <-->|paths| G[("Cloud Storage<br/>raw · proxies · intermediates · final")]
+    R <--> G
+    C <-->|upserts| P[("PostgreSQL (Cloud SQL)<br/>state · specs · errors")]
+    D3 -->|REST| L["External asset library"]
+    C -->|alerts| S["Slack / board tickets"]
 ```
-Intake form / project-management board (Monday.com)
-        │  webhook
-        ▼
-Bridge (Cloud Run) ── validates payload ──► triggers DAG via Airflow REST API
-        │
-        ▼
-Cloud Composer (Airflow 3.1)
-  DAG0  job registration and unique code
-  DAG1  ingest: copy to GCS, ffprobe, proxies, notification
-  DAG2  processing: IQC, trim, concat, validation, naming
-  DAG3  publish to external asset library (upload + tagging)
-        │                    │                     │
-        ▼                    ▼                     ▼
-  Cloud Run (ffmpeg      Cloud Storage         PostgreSQL
-  GPU NVENC / CPU,       (raw, proxies,        (Cloud SQL: state,
-  ffprobe, transcription) intermediates, final) specs, errors)
+
+### Job sequence
+
+```mermaid
+sequenceDiagram
+    participant Board as PM board
+    participant Bridge
+    participant Airflow
+    participant CR as Cloud Run (ffmpeg/ffprobe)
+    participant DB as PostgreSQL
+    participant Lib as Asset library
+    Board->>Bridge: webhook
+    Bridge->>Bridge: validate payload (422 on missing fields)
+    Bridge->>Airflow: trigger DAG
+    Airflow->>DB: upsert job (keyed by source item ID)
+    Airflow->>CR: ffprobe + proxies (DAG1)
+    Airflow->>DB: upsert per-file specs
+    Airflow->>CR: trim + concat per shotcode (DAG2)
+    CR-->>Airflow: 429 GPU busy → backoff and retry
+    Airflow->>CR: validate output stream
+    Airflow->>DB: upsert per-shotcode status
+    Airflow->>Lib: upload + tagging (DAG3)
+    Airflow->>DB: upsert per-asset state
 ```
 
 | Component | Role |
@@ -33,7 +55,7 @@ Cloud Composer (Airflow 3.1)
 | **Cloud Run** | Per-request ephemeral compute: webhook bridge, GPU ffmpeg (NVIDIA L4, NVENC), CPU ffmpeg (libx264/libx265), ffprobe + thumbnails + stream validation, transcription |
 | **GCS** | Media storage per stage; tasks pass *paths* between each other, never bytes |
 | **PostgreSQL (Cloud SQL)** | Source of truth for state: job, per-file technical specs, per-shotcode status, pipeline errors |
-| **External APIs** | Project-management board (GraphQL), asset library (REST), Slack (alerts), CRM |
+| **External APIs** | Project-management board (GraphQL), asset library (REST), Slack (alerts) |
 
 ## 3. Job flow
 
@@ -78,7 +100,7 @@ The pipeline assumes **any task can run more than once** (retry, manual clear, r
 
 ## 8. CI/CD
 
-> **Status:** both workflows are built on branches and are **not active yet** (pending Workload Identity Federation setup). Deploys are manual today.
+> **Status:** Designed and implemented the CI/CD (dry-run, approval gate, WIF); activation depended on infra provisioning owned by the IT team. Deploys are manual today.
 
 **CI (GitHub Actions)** — on every PR and on `main`; it only verifies, never deploys:
 - pytest unit tests in an environment that matches the Composer Python/Airflow version.
@@ -101,9 +123,4 @@ The pipeline assumes **any task can run more than once** (retry, manual clear, r
 
 ## 10. Design decisions
 
-| Decision | Trade-off |
-|---|---|
-| Heavy compute on Cloud Run, not on Airflow workers | Light workers and per-request scaling, at the cost of cold-start latency and per-request timeout limits |
-| GPU with concurrency=1 + Airflow pool | Predictable GPU usage, at the cost of queueing under spikes (mitigated with 429 + backoff) |
-| Postgres as source of truth, not XCom | Queryable, reprocessable state; requires idempotent upserts everywhere |
-| Manual-approval deploys | Slower, but no partial syncs to production |
+See [decisions.md](decisions.md).
